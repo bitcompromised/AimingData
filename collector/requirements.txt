@@ -1,0 +1,1 @@
+# No third-party dependencies. Windows input hooks use ctypes/Win32.

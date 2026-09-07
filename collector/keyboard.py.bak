@@ -1,0 +1,42 @@
+import ctypes, sys
+from ctypes import wintypes
+
+WH_KEYBOARD_LL = 13
+WM_KEYDOWN = 0x0100
+WM_KEYUP = 0x0101
+WM_SYSKEYDOWN = 0x0104
+WM_SYSKEYUP = 0x0105
+
+class KBDLLHOOKSTRUCT(ctypes.Structure):
+    _fields_ = [('vkCode', wintypes.DWORD), ('scanCode', wintypes.DWORD), ('flags', wintypes.DWORD), ('time', wintypes.DWORD), ('dwExtraInfo', ctypes.POINTER(ctypes.c_ulong))]
+
+VK_NAMES = {
+    0x08:'backspace',0x09:'tab',0x0D:'enter',0x10:'shift',0x11:'ctrl',0x12:'alt',0x1B:'escape',
+    0x20:'space',0x25:'left',0x26:'up',0x27:'right',0x28:'down',0x2D:'insert',0x2E:'delete',
+}
+
+def name_for_vk(vk):
+    if 0x41 <= vk <= 0x5A: return chr(vk).lower()
+    if 0x30 <= vk <= 0x39: return chr(vk)
+    if 0x70 <= vk <= 0x7B: return f'f{vk-0x6F}'
+    return VK_NAMES.get(vk, f'vk_{vk}')
+
+class KeyboardHook:
+    def __init__(self, record): self.record=record; self.hook=None; self.callback=None
+    def run(self):
+        if sys.platform != 'win32': return
+        user32=ctypes.windll.user32; kernel32=ctypes.windll.kernel32
+        Proc=ctypes.WINFUNCTYPE(ctypes.c_long,ctypes.c_int,wintypes.WPARAM,wintypes.LPARAM)
+        def proc(nCode,wParam,lParam):
+            if nCode >= 0 and wParam in (WM_KEYDOWN,WM_SYSKEYDOWN,WM_KEYUP,WM_SYSKEYUP):
+                info=ctypes.cast(lParam,ctypes.POINTER(KBDLLHOOKSTRUCT)).contents
+                state='down' if wParam in (WM_KEYDOWN,WM_SYSKEYDOWN) else 'up'
+                self.record('keyboard','key_'+state,{'key':name_for_vk(int(info.vkCode)),'vk':int(info.vkCode),'scanCode':int(info.scanCode)})
+            return user32.CallNextHookEx(self.hook,nCode,wParam,lParam)
+        self.callback=Proc(proc)
+        self.hook=user32.SetWindowsHookExW(WH_KEYBOARD_LL,self.callback,kernel32.GetModuleHandleW(None),0)
+        if not self.hook: raise ctypes.WinError()
+        msg=wintypes.MSG()
+        while user32.GetMessageW(ctypes.byref(msg),None,0,0)>0:
+            user32.TranslateMessage(ctypes.byref(msg)); user32.DispatchMessageW(ctypes.byref(msg))
+        user32.UnhookWindowsHookEx(self.hook)
