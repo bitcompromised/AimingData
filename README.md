@@ -1,6 +1,6 @@
 # Inaccurate but cool UI for the audioPlayer:
-![Alt Text](81.png)
-![Alt Text](82.png])
+![Alt Text](1.png)
+![Alt Text](2.png)
 
 
 # Mouse-Stats — functional MVP
