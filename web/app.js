@@ -1,26 +1,99 @@
+// app.js — shell, router, shared state & polling.
 const API='http://127.0.0.1:3001/api';
-const S={page:'Dashboard',health:null,sessions:[],active:null,selected:null,events:[],playing:false,playStart:0,playPos:0,speed:1};
-const nav=[['Dashboard','⌂'],['Sessions','◷'],['Replays','▶'],['Statistics','▥'],['Settings','⚙']];
-const $=(s,r=document)=>r.querySelector(s); const esc=x=>String(x??'').replace(/[&<>"']/g,c=>({'&':'&amp;','<':'&lt;','>':'&gt;','"':'&quot;',"'":'&#39;'}[c]));
-async function api(path,opt){const r=await fetch(API+path,opt);const j=await r.json();if(!r.ok)throw Error(j.message||j.error||r.status);return j}
-function shell(content){document.querySelector('#app').innerHTML=`<div class="app"><aside><div class="brand"><span>⌁</span><b>Mouse-Stats</b></div><nav>${nav.map(n=>`<button class="nav ${S.page===n[0]?'active':''}" data-page="${n[0]}"><i>${n[1]}</i>${n[0]}</button>`).join('')}</nav><div class="collector"><i class="dot ${S.health?.collector?.ok?'on':''}"></i><div><b>Collector ${S.health?.collector?.ok?'Running':'Offline'}</b><small>${S.health?.collector?.platform||'waiting'}</small><small>${S.health?.collector?.bufferedEvents??0} buffered events</small></div></div></aside><main>${content}</main></div>`;document.querySelectorAll('[data-page]').forEach(b=>b.onclick=()=>{S.page=b.dataset.page;render()})}
-function header(title,sub,action=''){return `<header><div><div class="eyebrow">VALORANT · telemetry</div><h1>${esc(title)}</h1><p>${esc(sub)}</p></div>${action}</header>`}
-function card(label,value,sub){return `<div class="card"><span>${label}</span><strong>${value}</strong><small>${sub}</small></div>`}
-function canvas(kind){return `<canvas class="chart" data-chart="${kind}"></canvas>`}
-function drawCharts(){document.querySelectorAll('canvas.chart').forEach(c=>{const d=c.dataset.chart,w=c.clientWidth||600,h=c.clientHeight||180,ratio=devicePixelRatio||1;c.width=w*ratio;c.height=h*ratio;const x=c.getContext('2d');x.scale(ratio,ratio);x.strokeStyle='#17304b';for(let y=30;y<h;y+=30){x.beginPath();x.moveTo(0,y);x.lineTo(w,y);x.stroke()}x.strokeStyle=d==='speed'?'#a96fff':'#4b94ff';x.lineWidth=2;x.beginPath();let events=S.events.filter(e=>e.type==='mouse_move');if(events.length){const step=Math.max(1,Math.floor(events.length/300));let pts=[];let max=1;events.forEach(e=>{const dx=e.data.dx||0,dy=e.data.dy||0;pts.push(Math.hypot(dx,dy));max=Math.max(max,pts.at(-1))});pts=pts.filter((_,i)=>i%step===0);pts.forEach((v,i)=>{const px=i*w/Math.max(1,pts.length-1),py=h-12-(v/max)*(h-24);i?x.lineTo(px,py):x.moveTo(px,py)});}else{for(let i=0;i<120;i++){const px=i*w/119,py=h/2+Math.sin(i*.3)*25+Math.sin(i*1.4)*8;i?x.lineTo(px,py):x.moveTo(px,py)}}x.stroke()})}
-function metrics(events){let dist=0,keys=0,buttons=0;for(const e of events){if(e.type==='mouse_move')dist+=Math.hypot(e.data.dx||0,e.data.dy||0);if(e.device==='keyboard'&&e.type==='key_down')keys++;if(e.type==='mouse_button'&&e.data.state==='down')buttons++}return {dist,keys,buttons}}
-function dashboard(){const m=metrics(S.events);const active=S.active?`<button class="primary" id="stop">■ Stop & Save</button>`:`<button class="primary" id="start">● Start Capture</button>`;return header('Dashboard',S.active?'Live capture in progress':'Raw input telemetry and analysis',active)+`<section class="grid5">${card('Capture',''+(S.active?'LIVE':'IDLE'),S.active?'recording now':'start a session to collect data')}${card('Mouse events',m.dist.toFixed(0), 'raw counts moved')}${card('Keyboard',m.keys,'key-down events')}${card('Buttons',m.buttons,'mouse-button presses')}${card('Buffer',S.health?.collector?.bufferedEvents??0,'collector events')}</section><section class="hero"><div class="panel"><div class="panel-head"><h2>Mouse Movement</h2><span>${S.events.length} events</span></div>${canvas('movement')}</div><div class="panel"><div class="panel-head"><h2>Live Input</h2><span>${S.health?.collector?.platform||'unknown'}</span></div><div class="live-list">${S.events.slice(-18).reverse().map(e=>`<div><b>${esc(e.type)}</b><small>${e.timestamp.toFixed(6)} · ${esc(e.device)}</small></div>`).join('')||'<p class="empty">Start capture and move your mouse or press keys.</p>'}</div></div></section><section class="bottom"><div class="panel"><div class="panel-head"><h2>Mouse Speed</h2><span>raw counts / event interval</span></div>${canvas('speed')}</div><div class="panel"><div class="panel-head"><h2>Input Summary</h2></div><div class="summary"><div>Mouse distance <b>${m.dist.toFixed(1)}</b></div><div>Key presses <b>${m.keys}</b></div><div>Button presses <b>${m.buttons}</b></div><div>Dropped <b>${S.health?.collector?.droppedEvents??0}</b></div></div></div></section>`}
+const S={
+  page:'Dashboard',health:null,game:null,active:null,sessions:[],settings:null,
+  selected:null,selEvents:[],statScope:'all',statSessions:[],
+  live:{events:[],lastT:0},play:{playing:false,pos:0,speed:1,raf:0},
+};
+const $=(s,r=document)=>r.querySelector(s);
+const $$=(s,r=document)=>[...r.querySelectorAll(s)];
+const esc=x=>String(x??'').replace(/[&<>"']/g,c=>({'&':'&amp;','<':'&lt;','>':'&gt;','"':'&quot;',"'":'&#39;'}[c]));
+async function api(path,opt){const r=await fetch(API+path,opt);const j=await r.json().catch(()=>({}));if(!r.ok)throw Error(j.message||j.error||r.status);return j}
+function fmtDur(v){v=Number(v||0);if(v<60)return `${v.toFixed(1)}s`;const m=Math.floor(v/60);if(m<60)return `${m}m ${Math.floor(v%60)}s`;return `${Math.floor(m/60)}h ${m%60}m`}
+const nav=[['Dashboard','home'],['Sessions','list'],['Settings','gear']];
+const ICONS={home:'⌂',list:'☰',gear:'⚙'};
+
+function shell(content){
+  const ok=S.health?.collector?.ok;
+  $('#app').innerHTML=`<div class="app">
+  <aside>
+    <div class="brand"><span class="logo">🖱</span><b>Mouse<span>Stats</span></b></div>
+    <nav>${nav.map(n=>`<button class="nav ${S.page===n[0]?'active':''}" data-page="${n[0]}"><i>${ICONS[n[1]]||''}</i>${n[0]}</button>`).join('')}</nav>
+    <div class="collector">
+      <div class="row"><i class="dot ${ok?'on':''}"></i><b>Collector ${ok?'Running':'Offline'}</b></div>
+      <small>${esc(S.health?.collector?.platform||'waiting')} · pid ${S.health?.collector?.pid||'—'}</small>
+      <small>Node.js core connected</small>
+      ${gameBadge()}
+    </div>
+  </aside>
+  <main id="main">${content}</main></div>`;
+  $$('aside [data-page]').forEach(b=>b.onclick=()=>go(b.dataset.page));
+}
+function gameBadge(){
+  const g=S.game;if(!g)return '';
+  const phase=g.phase||'menu';
+  const cls=phase==='live'?'live':phase==='agent_select'?'sel':phase==='postmatch'?'post':'';
+  const label=phase==='live'?'In match':phase==='agent_select'?'Agent select':phase==='postmatch'?'Post match':'In menus';
+  return `<div class="gamebadge ${cls}"><small>VALORANT</small><b>${esc(label)}</b>${g.map?`<small>${esc(g.map)} · R${g.round??'-'}</small>`:''}</div>`;
+}
+function header(title,sub,action=''){
+  return `<header><div><div class="eyebrow">VALORANT · RAW INPUT TELEMETRY</div><h1>${esc(title)}</h1><p>${esc(sub)}</p></div><div class="hdr-actions">${action}</div></header>`;
+}
+function panel(title,inner,extra=''){
+  return `<section class="panel"><div class="panel-head"><h2>${title}</h2>${extra}</div>${inner}</section>`;
+}
+function canvasEl(kind,h=180){return `<div class="chart-wrap" style="height:${h}px"><canvas class="chart" data-chart="${kind}"></canvas></div>`}
+function go(page){S.page=page;render()}
+async function refresh(){
+  try{
+    S.health=await api('/health');
+    S.game=S.health.game||null;
+    S.active=S.health.active||null;
+  }catch(e){S.health={collector:{ok:false}};S.game=null;S.active=null}
+  try{if(!S.settings)S.settings=await api('/settings')}catch(e){}
+}
 async function loadSessions(){try{S.sessions=(await api('/sessions')).sessions}catch{S.sessions=[]}}
-function sessions(){return header('Sessions','Recorded input sessions','')+`<div class="panel"><div class="toolbar"><button class="primary" id="start2">● Start Capture</button></div><table><thead><tr><th>Date / Time</th><th>Duration</th><th>Events</th><th>Map</th><th>Status</th></tr></thead><tbody>${S.sessions.map(s=>`<tr data-session="${s.sessionId}"><td><b>${esc(new Date(s.createdAt).toLocaleString())}</b></td><td>${fmt(s.durationSeconds)}</td><td>${s.eventCount}</td><td>${esc(s.map)}</td><td><span class="status">● Saved</span></td></tr>`).join('')||'<tr><td colspan="5" class="empty">No saved sessions yet.</td></tr>'}</tbody></table></div>`}
-function fmt(v){v=Number(v||0);return v<60?`${v.toFixed(1)}s`:`${Math.floor(v/60)}m ${(v%60).toFixed(0)}s`}
-async function selectSession(id){const r=await api('/sessions/'+id);S.selected=r.session;S.events=r.session.events||[];S.page='Replays';render()}
-function replays(){const s=S.selected;return header('Replays','Timestamp-based raw-input playback',s?`<button class="primary" id="restart">↻ Restart</button>`:'')+`<section class="replay-layout"><div class="panel list">${S.sessions.map(x=>`<button class="item ${s?.sessionId===x.sessionId?'sel':''}" data-session="${x.sessionId}">${esc(new Date(x.createdAt).toLocaleString())}<small>${x.eventCount} events · ${fmt(x.durationSeconds)}</small></button>`).join('')||'<p class="empty">Save a capture to create a replay.</p>'}</div><div class="panel replay"><div class="replay-stage"><div class="cursor" id="cursor"></div><span>RAW INPUT REPLAY</span></div><div class="timeline"><input id="seek" type="range" min="0" max="1000" value="0"><div class="controls"><button id="play">${S.playing?'Ⅱ':'▶'}</button><select id="speed"><option>0.1</option><option>0.25</option><option>0.5</option><option selected>1</option><option>2</option><option>4</option><option>8</option></select><span>${s?fmt(s.durationSeconds):'0.0s'}</span></div></div><div class="panel-head"><h2>Input Overlay</h2><span>${s?S.events.length:0} events</span></div>${canvas('movement')}</div></section>`}
-function statistics(){const all=S.sessions;let ev=all.flatMap(s=>s.events||[]),m=metrics(ev);return header('Statistics','Computed from saved raw sessions')+`<section class="grid4">${card('Sessions',all.length,'saved captures')}${card('Mouse counts',m.dist.toFixed(0),'total movement')}${card('Key presses',m.keys,'key-down events')}${card('Mouse buttons',m.buttons,'button-down events')}</section><div class="panel"><div class="panel-head"><h2>Movement Over Saved Data</h2></div>${canvas('movement')}</div><div class="panel pad"><h2>Analysis readiness</h2><p class="muted">The raw-data pipeline is live. Higher-level flick, overshoot, stability, frequency and reaction analyses can now operate on these timestamped events without changing the stored source data.</p></div>`}
-function settings(){return header('Settings','Collector and application configuration')+`<section class="settings"><div class="panel pad"><h2>Collector</h2><p>Status: <b>${S.health?.collector?.ok?'Running':'Offline'}</b></p><p>Platform: ${esc(S.health?.collector?.platform||'unknown')}</p><p>Buffer: ${S.health?.collector?.bufferedEvents??0} / ${S.health?.collector?.capacity??0}</p><button id="clear">Clear collector buffer</button></div><div class="panel pad"><h2>Capture metadata</h2><label>Game<input value="VALORANT" disabled></label><label>Mode<select><option>Competitive</option><option>Unrated</option><option>Custom</option></select></label><label>Map<input value="Unknown"></label><label>DPI<input value="800" type="number"></label><label>Sensitivity<input value="0.5" type="number" step="0.01"></label></div></section>`}
-async function start(){await api('/sessions/start',{method:'POST',headers:{'Content-Type':'application/json'},body:JSON.stringify({game:'VALORANT',mode:'Competitive',map:'Unknown',settings:{dpi:800,pollingRate:1000,sensitivity:.5,resolution:'1920x1080'}})});await refresh()}
-async function stop(){await api('/sessions/stop',{method:'POST'});S.events=[];await refresh();S.page='Sessions';render()}
-async function refresh(){try{S.health=await api('/health');S.active=(await api('/sessions/active')).session;if(S.active){const c=await api('/collector/recent?limit=250');S.events=c.events||[]}}catch(e){S.health={collector:{ok:false}};S.active=null}}
-function bind(){const startBtn=$('#start')||$('#start2');if(startBtn)startBtn.onclick=start;const stopBtn=$('#stop');if(stopBtn)stopBtn.onclick=stop;document.querySelectorAll('[data-session]').forEach(x=>x.onclick=()=>selectSession(x.dataset.session));const clear=$('#clear');if(clear)clear.onclick=async()=>{await fetch('http://127.0.0.1:8765/clear',{method:'POST'});await refresh();render()};const play=$('#play');if(play)play.onclick=()=>{S.playing=!S.playing;S.playStart=performance.now();render()};const restart=$('#restart');if(restart)restart.onclick=()=>{S.playPos=0;render()};const speed=$('#speed');if(speed)speed.onchange=()=>S.speed=Number(speed.value);const seek=$('#seek');if(seek)seek.oninput=()=>{S.playPos=Number(seek.value)/1000*(S.selected?.durationSeconds||0);updateCursor()}}
-function updateCursor(){const c=$('#cursor');if(!c||!S.selected)return;const ev=S.events.filter(e=>e.type==='mouse_move');if(!ev.length)return;const idx=Math.min(ev.length-1,Math.floor((S.playPos/(S.selected.durationSeconds||1))*ev.length));let x=50,y=50;for(let i=0;i<=idx;i++){x+=(ev[i].data.dx||0)*.35;y+=(ev[i].data.dy||0)*.35}c.style.left=Math.max(2,Math.min(98,x))+'%';c.style.top=Math.max(2,Math.min(98,y))+'%'}
-async function render(){await refresh();if(S.page==='Sessions')await loadSessions();else await loadSessions();let content=S.page==='Dashboard'?dashboard():S.page==='Sessions'?sessions():S.page==='Replays'?replays():S.page==='Statistics'?statistics():settings();shell(content);bind();drawCharts();updateCursor()}
-setInterval(async()=>{await refresh();if(S.page==='Dashboard'){shell(dashboard());bind();drawCharts()}},1000);render();
+
+// ---- live event accumulation (incremental, 1:1 with wall clock) ------------
+async function pollLiveEvents(){
+  if(!S.active){S.live={events:[],lastT:0,sessionId:null};return null}
+  const now=S.health?.collector?.nowMonotonic||0;
+  if(!now)return null;
+  if(S.live.sessionId!==S.active.sessionId){S.live={events:[],lastT:0,sessionId:S.active.sessionId}}
+  const start=Math.max(S.active.startTimestamp,S.live.lastT+1e-4);
+  try{
+    const r=await api(`/collector/events?start=${start}&end=${now}`);
+    const ev=r.events||[];
+    if(ev.length){
+      S.live.events.push(...ev);
+      S.live.lastT=ev[ev.length-1].timestamp;
+    }
+    return S.live.events;
+  }catch(e){return S.live.events.length?S.live.events:null}
+}
+
+let tickers={};
+function render(){
+  (async()=>{
+    await refresh();
+    if(S.page==='Sessions')await loadSessions();
+    if(S.page==='Dashboard')await loadSessions();
+    const mod=S.page==='Dashboard'?Dash:S.page==='Sessions'?Sess:Sett;
+    shell(mod.render());
+    mod.mount();
+    tickers={Dashboard:Dash,Sessions:Sess,Settings:Sett};
+  })();
+}
+// Global 500ms tick: live pages update themselves; nothing re-renders the
+// settings page (protects input focus).
+setInterval(async()=>{
+  if(document.hidden)return;                    // 1:1 only while the graph is visible
+  await refresh();
+  if(S.page==='Dashboard'){await pollLiveEvents();Dash.tick()}
+  else if(S.page==='Sessions'){Sess.tick&&Sess.tick()}
+  // sidebar status
+  const ok=S.health?.collector?.ok;
+  const badge=$('.collector');if(badge){$('.collector .dot',badge)?.classList.toggle('on',!!ok);const b=$('.collector b',badge);if(b)b.textContent=`Collector ${ok?'Running':'Offline'}`}
+  const gb=$('.gamebadge');if(gb){const g=S.game;const wrap=gameBadge();if(wrap)gb.outerHTML=wrap}
+},500);
+render();

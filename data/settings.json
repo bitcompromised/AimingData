@@ -1,0 +1,25 @@
+{
+  "dpi": 800,
+  "pollingRate": 1000,
+  "sensitivity": 0.5,
+  "resolution": "1920x1080",
+  "autoCapture": true,
+  "autoStop": true,
+  "skipTheRange": true,
+  "bufferSize": 1000000,
+  "logLevel": "Info",
+  "theme": "Dark",
+  "language": "English",
+  "showNotifications": true,
+  "minimizeToTray": false,
+  "dataDirectory": "",
+  "retentionDays": 90,
+  "autoCleanup": true,
+  "debug": false,
+  "verbose": false,
+  "markerColors": {
+    "kill": "#22C55E",
+    "death": "#EF4444",
+    "round": "#3B82F6"
+  }
+}

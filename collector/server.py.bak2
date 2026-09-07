@@ -8,7 +8,6 @@ class CollectorServer(ThreadingHTTPServer):
 class Handler(BaseHTTPRequestHandler):
     buffer = None
     collector_info = None
-    game_info = None  # optional Valorant game-state snapshot callable
 
     def _send(self, status, payload):
         body = json.dumps(payload, separators=(',', ':')).encode('utf-8')
@@ -30,11 +29,7 @@ class Handler(BaseHTTPRequestHandler):
     def do_GET(self):
         parsed = urlparse(self.path)
         if parsed.path == '/health':
-            payload = {'ok': True, **self.buffer.stats(), **self.collector_info()}
-            if self.game_info:
-                try: payload['game'] = self.game_info()
-                except Exception: pass
-            self._send(200, payload)
+            self._send(200, {'ok': True, **self.buffer.stats(), **self.collector_info()})
             return
         if parsed.path == '/events':
             q = parse_qs(parsed.query)

@@ -1,8 +1,3 @@
-# Inaccurate but cool UI for the audioPlayer:
-![Alt Text](1.png)
-![Alt Text](2.png)
-
-
 # Mouse-Stats — functional MVP
 
 This version is an executable vertical slice rather than a static UI mockup.

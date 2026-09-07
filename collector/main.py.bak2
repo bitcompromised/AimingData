@@ -5,7 +5,6 @@ from buffer import EventBuffer
 from server import CollectorServer, Handler
 from mouse import MouseHook
 from keyboard import KeyboardHook
-from valorant import ValorantWatcher
 
 HOST='127.0.0.1'; PORT=int(os.getenv('MOUSE_STATS_COLLECTOR_PORT','8765'))
 buffer=EventBuffer(int(os.getenv('MOUSE_STATS_BUFFER','1000000')))
@@ -33,9 +32,6 @@ if __name__=='__main__':
         threading.Thread(target=run_hook,args=(KeyboardHook(record),),daemon=True).start()
     else:
         print('WARNING: global Windows input hooks are unavailable on this platform; HTTP collector remains active.')
-    game=ValorantWatcher(record)
-    Handler.game_info=staticmethod(game.snapshot)
-    threading.Thread(target=game.run,daemon=True).start()
     print(f'Collector listening on http://{HOST}:{PORT}', flush=True)
     server=CollectorServer((HOST,PORT),Handler)
     try: server.serve_forever()
