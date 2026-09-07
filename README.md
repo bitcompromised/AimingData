@@ -1,3 +1,5 @@
+![Alt Text](81.png)
+![Alt Text](8[2.png])
 # Mouse-Stats — functional MVP
 
 This version is an executable vertical slice rather than a static UI mockup.
