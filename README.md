@@ -26,6 +26,18 @@ Open `http://127.0.0.1:3001` if it does not open automatically.
 - statistics over saved raw events
 - collector status/settings
 
+## Storage layout
+Each session directory holds two files:
+
+- `session.json` — the full record, including every raw input event.
+- `meta.json` — a small sidecar with the same record minus `events`, plus a
+  precomputed `digest` (movement, flick and round rollups).
+
+The sidecar is written on save and backfilled the first time an older session is
+listed. Every screen except the replay player reads only the sidecar, so opening
+the app costs kilobytes rather than the full size of the event archive. Deleting
+a `meta.json` is safe — it is regenerated from `session.json` on next listing.
+
 ## Important boundary
 Game-specific round synchronization, Match API integration, and visual death detection are intentionally adapters still to be implemented. The collector does not understand Valorant. This follows the supplied specification: raw input is retained independently, while round/death metadata is synchronized in the core layer.
 

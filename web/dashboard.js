@@ -1,21 +1,42 @@
-// dashboard.js — live analytics dashboard (reference: AimingData 1.png).
+// dashboard.js — live analytics dashboard.
+//
+// The tick used to re-derive everything from the full event history at 2Hz —
+// several complete flick-detection passes, a full stage replay and a handful of
+// innerHTML rebuilds per second. It now keeps one incremental Analyzer per data
+// source, so a tick costs only the events that arrived since the last one, and
+// charts redraw on a slower cadence than the counters.
+const CHART_MS=1000;      // heavy charts redraw at most this often
+const LIVE_WINDOW=60;     // seconds of history shown by the live charts
+
 const Dash={
   tab:'movement',rtab:'details',statTab:'overview',scope:'all',stage:null,built:false,
+  an:null,anKey:null,lastRev:-1,lastChart:0,statsRev:-1,
 
   ctx(){
     if(S.active&&S.health?.collector){
-      return {live:true,sessionId:S.active.sessionId,events:S.live.events,
+      return {live:true,key:'live:'+S.active.sessionId,sessionId:S.active.sessionId,events:S.live.events,
         t0:S.active.startTimestamp,t1:S.health.collector.nowMonotonic,
         title:`Session: ${fmtDate(S.active.createdAt)}`,
         meta:`Valorant · ${S.active.mode||'—'} · ${S.active.map||'Pending'} · R${S.game?.round??'—'} · live`,
-        mode:S.active.mode,map:S.active.map,matchId:S.active.matchId};
+        mode:S.active.mode,map:S.active.map,matchId:S.active.matchId,createdAt:S.active.createdAt};
     }
-    const s=S.sessions[0];
-    if(s){return {live:false,sessionId:s.sessionId,events:s.events||[],t0:s.startTimestamp,t1:s.endTimestamp||s.startTimestamp+1,
-      title:`Session: ${fmtDate(s.createdAt)}`,
-      meta:`Valorant · ${s.mode||'—'} · ${s.map||'—'} · ${An.rounds(s.events||[],s.endTimestamp).length} rounds · ${fmtDur(s.durationSeconds)}`,
-      mode:s.mode,map:s.map,matchId:s.matchId}}
-    return {live:false,sessionId:null,events:[],t0:0,t1:1,title:'No session yet',meta:'Waiting for capture…',mode:'—',map:'—',matchId:null};
+    const s=S.latest,meta=S.sessions[0];
+    if(s&&meta){
+      return {live:false,key:'saved:'+s.sessionId,sessionId:s.sessionId,events:s.events||[],
+        t0:s.startTimestamp,t1:s.endTimestamp||s.startTimestamp+1,
+        title:`Session: ${fmtDate(s.createdAt)}`,
+        meta:`Valorant · ${s.mode||'—'} · ${s.map||'—'} · ${meta.digest?.rounds??0} rounds · ${fmtDur(s.durationSeconds)}`,
+        mode:s.mode,map:s.map,matchId:s.matchId,createdAt:s.createdAt};
+    }
+    return {live:false,key:'none',sessionId:null,events:[],t0:0,t1:1,title:'No session yet',meta:'Waiting for capture…',mode:'—',map:'—',matchId:null};
+  },
+
+  // One analyzer per data source, fed only the events it has not seen.
+  analyzer(c){
+    if(this.anKey!==c.key){this.an=new An.Analyzer();this.anKey=c.key}
+    this.an.feed(c.events);
+    if(!c.live)this.an.finalize();
+    return this.an;
   },
 
   render(){
@@ -75,190 +96,232 @@ const Dash={
 
   mount(){
     this.stage=new InputStage($('#stageCanvas'));
-    $$('[data-tab]').forEach(b=>b.onclick=()=>{this.tab=b.dataset.tab;$$('[data-tab]').forEach(x=>x.classList.toggle('active',x===b));$$('.tabpane[data-pane]').forEach(p=>p.classList.toggle('hidden',p.dataset.pane!==this.tab));this.drawAnalytics()});
-    $$('[data-rtab]').forEach(b=>b.onclick=()=>{this.rtab=b.dataset.rtab;$$('[data-rtab]').forEach(x=>x.classList.toggle('active',x===b));this.tick(true)});
-    $$('[data-stattab]').forEach(b=>b.onclick=async()=>{this.statTab=b.dataset.stattab;$$('[data-stattab]').forEach(x=>x.classList.toggle('active',x===b));await this.drawStats()});
-    $('#statScope').onchange=async e=>{this.scope=e.target.value;await this.drawStats()};
-    $('#btnStopCap')?.addEventListener('click',async()=>{await api('/sessions/stop',{method:'POST'});S.live={events:[],lastT:0};render()});
+    this.lastRev=-1;this.lastChart=0;this.statsRev=-1;
+    $$('[data-tab]').forEach(b=>b.onclick=()=>{this.tab=b.dataset.tab;$$('[data-tab]').forEach(x=>x.classList.toggle('active',x===b));$$('.tabpane[data-pane]').forEach(p=>p.classList.toggle('hidden',p.dataset.pane!==this.tab));this.lastChart=0;this.drawAnalytics()});
+    $$('[data-rtab]').forEach(b=>b.onclick=()=>{this.rtab=b.dataset.rtab;$$('[data-rtab]').forEach(x=>x.classList.toggle('active',x===b));this.lastRev=-1;this.tick()});
+    $$('[data-stattab]').forEach(b=>b.onclick=()=>{this.statTab=b.dataset.stattab;$$('[data-stattab]').forEach(x=>x.classList.toggle('active',x===b));this.statsRev=-1;this.drawStats()});
+    $('#statScope').value=this.scope;
+    $('#statScope').onchange=e=>{this.scope=e.target.value;this.statsRev=-1;this.drawStats()};
+    $('#btnStopCap')?.addEventListener('click',async()=>{await api('/sessions/stop',{method:'POST'});S.live={events:[],lastT:0,sessionId:null};S.latest=null;S.rev++;render()});
     $('#btnStartCap')?.addEventListener('click',async()=>{
       await api('/sessions/start',{method:'POST',headers:{'Content-Type':'application/json'},body:JSON.stringify({game:'VALORANT',mode:'Competitive',map:'Unknown',settings:{dpi:S.settings?.dpi,sensitivity:S.settings?.sensitivity,pollingRate:S.settings?.pollingRate,resolution:S.settings?.resolution}})});
       render();
     });
     this.built=true;
-    this.tick(true);
-    this.drawAnalytics();
+    this.tick();
     this.drawStats();
   },
 
   // --- per-tick updates (never rebuilds the page shell) ----------------------
-  async tick(force){
+  tick(){
+    // A poll cycle can land between renders, before mount() has built the page.
+    if(!this.stage||!document.getElementById('stageCanvas'))return;
     const c=this.ctx();
-    if(!c.sessionId){return}
-    const ev=c.events;
-    const sum=An.summary(ev,S.settings||{});
-    // KPI cards
-    setKpi('kd',sum.deaths?sum.kd.toFixed(2):sum.kills?sum.kd.toFixed(2):'—',`${sum.kills} / ${sum.deaths}`);
+    if(!c.sessionId)return;
+    // Elapsed time moves every tick even when no events arrived.
+    setText($('#capElapsed'),An.fmtT(c.t1-c.t0));
+    // Everything else is derived from event data; skip it when nothing changed.
+    if(S.rev===this.lastRev&&this.anKey===c.key)return;
+    const rev=S.rev;
+
+    const a=this.analyzer(c);
+    const sum=a.summary();
+    setKpi('kd',sum.deaths||sum.kills?sum.kd.toFixed(2):'—',`${sum.kills} / ${sum.deaths}`);
     setKpi('hs',sum.kills?sum.hsPct.toFixed(1)+'%':'—',`${sum.hs} HS of ${sum.kills} kills`);
     setKpi('flt',sum.flickLatency?`${sum.flickLatency.median} ms`:'—',sum.flickLatency?`min ${sum.flickLatency.min} · max ${sum.flickLatency.max}`:`${sum.flicks} flicks detected`);
     setKpi('spd',`${Math.round(sum.avg)} c/s`,`σ ${Math.round(sum.sd)} · peak ${An.fmtNum(sum.peak)}`);
     setKpi('keys',sum.keys.toLocaleString(),`${c.t1>c.t0?(sum.keys/(c.t1-c.t0)).toFixed(1):0}/s`);
-    const el=$('#capElapsed');if(el)el.textContent=An.fmtT(c.t1-c.t0);
-    // stage
-    this.stage.reset(ev,c.t0);
-    this.stage.advanceTo(c.t1);this.stage.draw();
-    // rounds
-    const rounds=An.rounds(ev,c.t1);
-    const rc=$('#roundsCount');if(rc)rc.textContent=rounds.length?`${rounds.length} rounds`:'';
-    const rl=$('#roundsList');
-    if(rl)rl.innerHTML=rounds.slice().reverse().map(r=>roundRow(r)).join('')||'<p class="empty">No rounds yet — waiting for VALORANT.</p>';
-    // round details / key events
+
+    // stage — attach() keeps the integrated cursor across ticks
+    this.stage.attach(c.events,c.t0);
+    this.stage.advanceTo(c.t1);
+    An.schedule('stage',()=>this.stage.draw());
+
+    const rounds=a.roundsAt(c.t1);
+    setText($('#roundsCount'),rounds.length?`${rounds.length} rounds`:'');
+    setHTML($('#roundsList'),rounds.length?rounds.slice().reverse().map(roundRow).join(''):'<p class="empty">No rounds yet — waiting for VALORANT.</p>');
+
+    const last=rounds[rounds.length-1];
     const box=$('#roundDetailsBox');
     if(box){
       if(this.rtab==='details'){
-        const r=rounds[rounds.length-1];
-        box.innerHTML=r?`<div class="round-head"><h3>Round ${r.n}</h3>${badge(r.kills>=r.deaths&&r.kills>0?'Ahead':'—',r.kills>=r.deaths&&r.kills>0?'green':'gray')}</div>
-          <div class="kv"><span>Start</span><b>${An.fmtT(r.t0-c.t0)}</b></div>
-          <div class="kv"><span>Duration</span><b>${fmtDur(c.live?(c.t1-r.t0):(r.t1-r.t0))}</b></div>
-          <div class="kv"><span>Kills / Deaths</span><b>${r.kills} / ${r.deaths}</b></div>
-          <div class="kv"><span>Distance</span><b>${An.fmtNum(r.distance)} counts</b></div>
-          <div class="kv"><span>Headshots</span><b>${r.headshots}</b></div>`:'<p class="empty">No round data — VALORANT log not detected yet.</p>';
+        setHTML(box,last?`<div class="round-head"><h3>Round ${last.n}</h3>${badge(last.kills>=last.deaths&&last.kills>0?'Ahead':'—',last.kills>=last.deaths&&last.kills>0?'green':'gray')}</div>
+          <div class="kv"><span>Start</span><b>${An.fmtT(last.t0-c.t0)}</b></div>
+          <div class="kv"><span>Duration</span><b>${fmtDur(c.live?(c.t1-last.t0):(last.t1-last.t0))}</b></div>
+          <div class="kv"><span>Kills / Deaths</span><b>${last.kills} / ${last.deaths}</b></div>
+          <div class="kv"><span>Distance</span><b>${An.fmtNum(last.distance)} counts</b></div>
+          <div class="kv"><span>Headshots</span><b>${last.headshots}</b></div>`:'<p class="empty">No round data — VALORANT log not detected yet.</p>');
       }else{
-        const tl=An.gameTimeline(ev).slice(-12).reverse();
-        box.innerHTML=tl.length?`<div class="vtimeline">${tl.map(e=>`<div class="vevent"><i style="background:${e.color}"></i><span>${An.fmtT(e.t-c.t0)}</span><b>${esc(e.label)}</b></div>`).join('')}</div>`:'<p class="empty">No game events yet.</p>';
+        const tl=a.timeline.slice(-12).reverse();
+        setHTML(box,tl.length?`<div class="vtimeline">${tl.map(e=>`<div class="vevent"><i style="background:${e.color}"></i><span>${An.fmtT(e.t-c.t0)}</span><b>${esc(e.label)}</b></div>`).join('')}</div>`:'<p class="empty">No game events yet.</p>');
       }
     }
-    // round analysis (right rail)
+
+    // round analysis (right rail) — O(1) rollup, no per-round re-analysis
     const ra=$('#roundAnalysis');
     if(ra){
-      const r=rounds[rounds.length-1];
-      const sumR=r?An.summary(ev.filter(e=>e.timestamp>=r.t0&&e.timestamp<=(r.t1||c.t1)),S.settings||{}):null;
-      ra.innerHTML=`<div class="ra-grid"><canvas id="raDonut" width="140" height="110"></canvas>
-        <div class="kv"><span>Headshots</span><b>${r?r.headshots:0}</b></div>
-        <div class="kv"><span>Kills / Deaths</span><b>${r?`${r.kills} / ${r.deaths}`:'—'}</b></div>
-        <div class="kv"><span>Avg Speed</span><b>${sumR?Math.round(sumR.avg)+' c/s':'—'}</b></div>
-        <div class="kv"><span>Distance</span><b>${sumR?An.fmtNum(sumR.dist):'—'}</b></div>
-        <div class="kv"><span>Flick Latency</span><b>${sumR&&sumR.flickLatency?sumR.flickLatency.median+' ms':'—'}</b></div></div>`;
-      const dc=$('#raDonut');if(dc)An.donut(dc,{value:sumR&&sumR.flicks?Math.min(1,sumR.flicks?avgEff(c.events,sumR):0):0,center:sumR&&sumR.flicks?Math.round(avgEff(c.events,sumR)*100)+'%':'—',label:'Flick efficiency',color:An.C.green});
+      const rs=a.roundStats(last);
+      const eff=rs?rs.efficiency:0;
+      setHTML(ra,`<div class="ra-grid"><canvas id="raDonut" width="140" height="110"></canvas>
+        <div class="kv"><span>Headshots</span><b>${last?last.headshots:0}</b></div>
+        <div class="kv"><span>Kills / Deaths</span><b>${last?`${last.kills} / ${last.deaths}`:'—'}</b></div>
+        <div class="kv"><span>Avg Speed</span><b>${rs?Math.round(rs.avg)+' c/s':'—'}</b></div>
+        <div class="kv"><span>Distance</span><b>${rs?An.fmtNum(rs.dist):'—'}</b></div>
+        <div class="kv"><span>Flicks</span><b>${rs?rs.flicks:'—'}</b></div></div>`);
+      const dc=$('#raDonut');
+      if(dc)An.schedule('raDonut',()=>An.donut(dc,{value:Math.min(1,eff),center:rs&&rs.flicks?Math.round(eff*100)+'%':'—',label:'Flick efficiency',color:An.C.green}));
     }
-    if(force||this.tab)this.drawAnalytics();
+
+    // Charts are the expensive half; run them on their own, slower cadence.
+    const now=performance.now();
+    if(now-this.lastChart>=CHART_MS){this.lastChart=now;this.drawAnalytics(a,c)}
+    this.lastRev=rev;
   },
 
-  drawAnalytics(){
-    const c=this.ctx();const ev=c.events;
+  drawAnalytics(a,c){
+    c=c||this.ctx();
+    a=a||this.analyzer(c);
     const sens=S.settings?.sensitivity??0.5,dpi=S.settings?.dpi??800;
-    const win=c.live?[Math.max(c.t0,c.t1-60),c.t1]:[c.t0,c.t1];
+    const win=c.live?[Math.max(c.t0,c.t1-LIVE_WINDOW),c.t1]:[c.t0,c.t1];
     const X=t=>An.fmtT(t-c.t0);
-    const ge=An.gameTimeline(ev);
-    const markers=ge.map(e=>({t:e.t,color:e.color}));
+
     if(this.tab==='movement'){
       const cv=$('[data-chart="xy"]');if(!cv)return;
-      const mv=An.moves(ev).filter(e=>e.timestamp>=win[0]);
-      const step=Math.max(1,Math.floor(mv.length/600));
-      const xs=[],ys=[];
-      for(let i=0;i<mv.length;i+=step){xs.push({x:mv[i].timestamp,y:mv[i].data.dx||0});ys.push({x:mv[i].timestamp,y:mv[i].data.dy||0})}
-      An.lineChart(cv,{t0:win[0],t1:win[1],xFmt:X,series:[{name:'X (horizontal)',color:An.C.blue,points:xs},{name:'Y (vertical)',color:An.C.purple,points:ys}]});
+      const {xs,ys}=a.moveSeries(win[0],600);
+      An.schedule('xy',()=>An.lineChart(cv,{t0:win[0],t1:win[1],xFmt:X,series:[
+        {name:'X (horizontal)',color:An.C.blue,points:xs},
+        {name:'Y (vertical)',color:An.C.purple,points:ys}]}));
+      return;
     }
     if(this.tab==='aim'){
       const cv=$('[data-chart="dual"]');if(!cv)return;
-      const sig=An.speedSignal(ev).filter(s=>s.t>=win[0]);
-      const n=160;const binsC=An.binSignal(sig,win[0],win[1],n,'max');
-      const binsD=binsC.map(b=>({x:b.x,y:b.v*An.degPerCount(sens)}));
-      An.lineChart(cv,{t0:win[0],t1:win[1],xFmt:X,rightAxis:true,yLeft:{max:An.niceMax(Math.max(1,...binsC.map(b=>b.v)))},yRight:{max:An.niceMax(Math.max(1,...binsD.map(b=>b.v)))},
-        series:[{name:'Raw speed (counts/s)',color:An.C.blue,points:binsC.map(b=>({x:b.x,y:b.v}))},
-                {name:`Translated (${An.edpi(dpi,sens)} eDPI → °/s)`,color:An.C.purple,points:binsD,axis:'right'}]});
-      const fl=An.detectFlicks(ev).slice(-8).reverse();
-      const ft=$('#flickTable');
-      if(ft)ft.innerHTML=fl.length?`<table class="mini"><thead><tr><th>Time</th><th>Peak (c/s)</th><th>Peak (°/s)</th><th>Angle</th><th>Dur</th><th>Micro</th><th>Correct</th><th>Flick-back</th></tr></thead><tbody>
-        ${fl.map(f=>`<tr><td>${An.fmtT(f.t0-c.t0)}</td><td>${Math.round(f.peak)}</td><td>${Math.round(f.peak*An.degPerCount(sens))}</td><td>${f.angleDeg}°</td><td>${f.durMs}ms</td><td>${f.micro}</td><td>${f.correctionMs}ms</td><td>${f.flickBack?`✓ ${f.flickBack.delayMs}ms`:'—'}</td></tr>`).join('')}</tbody></table>
-        <p class="muted">Translation uses yaw 0.022°/count: deg/s = counts/s × 0.022 × sens (${sens}) — DPI (${dpi}) scales physical distance, eDPI (${An.edpi(dpi,sens)}) scales in-game rotation. Left axis is hardware counts/s; right axis is the in-game speed it produces.</p>`:'<p class="muted">No flicks detected yet in this window.</p>';
+      const binsC=a.speedBins(win[0],win[1],160,'max');
+      const deg=An.degPerCount(sens);
+      let cmax=1;for(const b of binsC)if(b.v>cmax)cmax=b.v;
+      An.schedule('dual',()=>An.lineChart(cv,{t0:win[0],t1:win[1],xFmt:X,rightAxis:true,
+        yLeft:{max:An.niceMax(cmax)},yRight:{max:An.niceMax(cmax*deg)},
+        series:[{name:'Raw speed (counts/s)',color:An.C.blue,points:binsC.map(b=>({x:b.t,y:b.v}))},
+                {name:`Translated (${An.edpi(dpi,sens)} eDPI → °/s)`,color:An.C.purple,points:binsC.map(b=>({x:b.t,y:b.v*deg})),axis:'right'}]}));
+      const fl=a.flicks.slice(-8).reverse();
+      setHTML($('#flickTable'),fl.length?`<table class="mini"><thead><tr><th>Time</th><th>Peak (c/s)</th><th>Peak (°/s)</th><th>Angle</th><th>Dur</th><th>Micro</th><th>Correct</th><th>Flick-back</th></tr></thead><tbody>
+        ${fl.map(f=>`<tr><td>${An.fmtT(f.t0-c.t0)}</td><td>${Math.round(f.peak)}</td><td>${Math.round(f.peak*deg)}</td><td>${f.angleDeg}°</td><td>${f.durMs.toFixed(0)}ms</td><td>${f.micro}</td><td>${f.correctionMs}ms</td><td>${f.flickBack?`✓ ${f.flickBack.delayMs}ms`:'—'}</td></tr>`).join('')}</tbody></table>
+        <p class="muted">Translation uses yaw 0.022°/count: deg/s = counts/s × 0.022 × sens (${sens}) — DPI (${dpi}) scales physical distance, eDPI (${An.edpi(dpi,sens)}) scales in-game rotation. Left axis is hardware counts/s; right axis is the in-game speed it produces.</p>`:'<p class="muted">No flicks detected yet in this window.</p>');
+      return;
     }
     if(this.tab==='keyboard'){
       const kv=$('[data-chart="keys"]'),kt=$('[data-chart="keyticks"]');
-      const counts={};for(const e of An.keyPresses(ev))counts[e.data.key]=(counts[e.data.key]||0)+1;
-      const items=Object.entries(counts).sort((a,b)=>b[1]-a[1]).map(([label,value])=>({label,value,color:An.C.purple}));
-      if(kv)An.bars(kv,{items});
-      if(kt)An.tickStrip(kt,{t0:win[0],t1:win[1],xFmt:X,lanes:[{name:'Key Press',color:An.C.purple,ticks:An.keyPresses(ev).map(e=>e.timestamp)}]});
+      const items=a.topKeys(8).map(i=>({...i,color:An.C.purple}));
+      if(kv)An.schedule('keys',()=>An.bars(kv,{items}));
+      if(kt){const ticks=a.keyTicks(win[0]);An.schedule('keyticks',()=>An.tickStrip(kt,{t0:win[0],t1:win[1],xFmt:X,lanes:[{name:'Key Press',color:An.C.purple,ticks}]}))}
+      return;
     }
     if(this.tab==='heatmap'){
       const cv=$('[data-chart="heat"]');if(!cv)return;
-      An.heatmap(cv,{grid:An.heatmapGrid(ev,96,48,true)});
+      An.schedule('heat',()=>An.heatmap(cv,{grid:a.heat,max:a.heatMax}));
+      return;
     }
     if(this.tab==='freq'){
       const cv=$('[data-chart="spec"]');if(!cv)return;
-      const sig=An.speedSignal(ev).filter(s=>s.t>=win[0]);
-      const bins=An.binSignal(sig,win[0],win[1],256,'mean');
+      const bins=a.speedBins(win[0],win[1],256,'mean');
       const mags=An.spectrum(bins,48);
-      An.spectrumChart(cv,{mags});
-      const dom=mags.slice().sort((a,b)=>b.mag-a.mag)[0];
-      const note=$('#freqNote');if(note)note.textContent=dom&&dom.mag>1?`Dominant tremor component ≈ ${(dom.freq*((win[1]-win[0])/256)).toFixed(1)} Hz (${dom.freq}th harmonic of a ${(win[1]-win[0]).toFixed(0)}s window)`:'Not enough motion to estimate a spectrum.';
+      An.schedule('spec',()=>An.spectrumChart(cv,{mags}));
+      let dom=null;for(const m of mags)if(!dom||m.mag>dom.mag)dom=m;
+      setText($('#freqNote'),dom&&dom.mag>1
+        ?`Dominant tremor component ≈ ${(dom.freq*((win[1]-win[0])/256)).toFixed(1)} Hz (${dom.freq}th harmonic of a ${(win[1]-win[0]).toFixed(0)}s window)`
+        :'Not enough motion to estimate a spectrum.');
     }
   },
 
-  async drawStats(){
+  // Statistics run entirely off session metadata digests computed by the core.
+  // No screen downloads raw events for more than one session at a time.
+  drawStats(){
     const box=$('#statBox');if(!box)return;
-    let list=S.sessions;
-    if(this.scope==='all'&&!S.statSessions.length){
-      try{S.statSessions=(await api('/sessions')).sessions.filter(s=>(s.events||[]).length)}catch{}
-    }
     const c=this.ctx();
-    const src=this.scope==='all'?S.statSessions:[c.sessionId?{...c,events:c.events,createdAt:(S.active?S.active.createdAt:(S.sessions[0]&&S.sessions[0].createdAt))||new Date().toISOString()}:null].filter(Boolean);
-    if(!src.length){box.innerHTML='<p class="empty">No session data available yet.</p>';return}
-    const sens=S.settings?.sensitivity??0.5,dpi=S.settings?.dpi??800;
-    const sums=src.map(s=>({s,sum:An.summary(s.events||[],S.settings||{})}));
-    const agg=sums.reduce((a,x)=>({kills:a.kills+x.sum.kills,deaths:a.deaths+x.sum.deaths,hs:a.hs+x.sum.hs,keys:a.keys+x.sum.keys,btn:a.btn+x.sum.btn,dist:a.dist+x.sum.dist,dur:a.dur+x.sum.duration,events:a.events+x.sum.events,flicks:a.flicks+x.sum.flicks}),{kills:0,deaths:0,hs:0,keys:0,btn:0,dist:0,dur:0,events:0,flicks:0});
+    const key=`${this.statTab}|${this.scope}|${S.sessions.length}|${S.rev}`;
+    if(this.statsRev===key)return;
+    this.statsRev=key;
+
+    let src;
+    if(this.scope==='all'){
+      src=S.sessions.filter(s=>s.digest&&s.digest.events);
+    }else{
+      const a=c.sessionId?this.analyzer(c):null;
+      src=a?[{createdAt:c.createdAt||new Date().toISOString(),mode:c.mode,map:c.map,
+        digest:{...a.summary(),rounds:a.roundsAt(c.t1).length,topKeys:a.topKeys(12),
+          avgFlickEfficiency:a.avgFlickEfficiency()}}]:[];
+    }
+    if(!src.length){setHTML(box,'<p class="empty">No session data available yet.</p>');return}
+
+    const agg=src.reduce((x,s)=>{const d=s.digest;return{
+      kills:x.kills+d.kills,deaths:x.deaths+d.deaths,hs:x.hs+d.hs,keys:x.keys+d.keys,
+      btn:x.btn+d.btn,dist:x.dist+d.dist,dur:x.dur+d.duration,events:x.events+d.events,
+      flicks:x.flicks+d.flicks};},
+      {kills:0,deaths:0,hs:0,keys:0,btn:0,dist:0,dur:0,events:0,flicks:0});
     const kdm=agg.deaths?agg.kills/agg.deaths:agg.kills;
     const hsm=agg.kills?agg.hs/agg.kills*100:0;
-    const lat=sums.map(x=>x.sum.flickLatency).filter(Boolean);
-    const medLat=lat.length?lat.map(l=>l.median).sort((a,b)=>a-b)[Math.floor(lat.length/2)]:null;
+    const lat=src.map(s=>s.digest.flickLatency).filter(Boolean).map(l=>l.median).sort((a,b)=>a-b);
+    const medLat=lat.length?lat[lat.length>>1]:null;
+
     if(this.statTab==='overview'){
-      box.innerHTML=`<section class="kpi4">
+      setHTML(box,`<section class="kpi4">
         ${kpi('Sessions','',src.length,'saved','list',An.C.blue)}
         ${kpi('Total Events','',An.fmtNum(agg.events),'raw input','mouse',An.C.purple)}
         ${kpi('Total Time','',fmtDur(agg.dur),'captured','clock',An.C.teal)}
         ${kpi('K/D','',kdm.toFixed(2),`${agg.kills} / ${agg.deaths}`,'target',An.C.green)}</section>
         <table class="mini"><thead><tr><th>Session</th><th>Mode</th><th>Map</th><th>Duration</th><th>Events</th><th>K/D</th></tr></thead><tbody>
-        ${sums.slice(0,8).map(x=>`<tr><td>${esc(new Date(x.s.createdAt).toLocaleString())}</td><td>${esc(x.s.mode||'—')}</td><td>${esc(x.s.map||'—')}</td><td>${fmtDur(x.sum.duration)}</td><td>${x.sum.events}</td><td>${x.sum.deaths?x.sum.kd.toFixed(2):x.sum.kills?x.sum.kd.toFixed(2):'—'}</td></tr>`).join('')}</tbody></table>`;
+        ${src.slice(0,8).map(s=>`<tr><td>${esc(new Date(s.createdAt).toLocaleString())}</td><td>${esc(s.mode||'—')}</td><td>${esc(s.map||'—')}</td><td>${fmtDur(s.digest.duration)}</td><td>${s.digest.events}</td><td>${s.digest.deaths||s.digest.kills?s.digest.kd.toFixed(2):'—'}</td></tr>`).join('')}</tbody></table>`);
     }else if(this.statTab==='saim'){
-      box.innerHTML=`<section class="kpi4">
+      setHTML(box,`<section class="kpi4">
         ${kpi('Headshot %','',agg.kills?hsm.toFixed(1)+'%':'—',`${agg.hs} HS`,'aim',An.C.blue)}
         ${kpi('K/D','',kdm.toFixed(2),`${agg.kills} kills`,'target',An.C.blue)}
         ${kpi('Flick Latency','',medLat?medLat+' ms':'—','median flick → click','react',An.C.teal)}
         ${kpi('Flicks','',agg.flicks,'detected bursts','bolt',An.C.orange)}</section>
-        <div class="grid2">${canvasEl('statTrend',220)}${canvasEl('statPerf',220)}</div>`;
+        <div class="grid2">${canvasEl('statTrend',220)}${canvasEl('statPerf',220)}</div>`);
       const t1=$('[data-chart="statTrend"]'),p1=$('[data-chart="statPerf"]');
-      if(t1)An.lineChart(t1,{t0:0,t1:Math.max(1,sums.length-1),xFmt:i=>`#${Math.round(i)+1}`,xTicks:Math.min(6,sums.length-1),
-        series:[{name:'Headshot %',color:An.C.blue,points:sums.map((x,i)=>({x:i,y:x.sum.hsPct}))},{name:'K/D ×20',color:An.C.purple,points:sums.map((x,i)=>({x:i,y:x.sum.kd*20}))}]});
-      if(p1)An.lineChart(p1,{t0:0,t1:Math.max(1,sums.length-1),xFmt:i=>`#${Math.round(i)+1}`,xTicks:Math.min(6,sums.length-1),
-        series:[{name:'Avg speed (c/s)',color:An.C.green,points:sums.map((x,i)=>({x:i,y:x.sum.avg}))},{name:'Peak (c/s)',color:An.C.orange,points:sums.map((x,i)=>({x:i,y:x.sum.peak}))}]});
+      const xa={t0:0,t1:Math.max(1,src.length-1),xFmt:i=>`#${Math.round(i)+1}`,xTicks:Math.min(6,Math.max(1,src.length-1))};
+      if(t1)An.schedule('statTrend',()=>An.lineChart(t1,{...xa,series:[
+        {name:'Headshot %',color:An.C.blue,points:src.map((s,i)=>({x:i,y:s.digest.hsPct}))},
+        {name:'K/D ×20',color:An.C.purple,points:src.map((s,i)=>({x:i,y:s.digest.kd*20}))}]}));
+      if(p1)An.schedule('statPerf',()=>An.lineChart(p1,{...xa,series:[
+        {name:'Avg speed (c/s)',color:An.C.green,points:src.map((s,i)=>({x:i,y:s.digest.avg}))},
+        {name:'Peak (c/s)',color:An.C.orange,points:src.map((s,i)=>({x:i,y:s.digest.peak}))}]}));
     }else if(this.statTab==='smovement'){
-      box.innerHTML=`<div class="grid2">${canvasEl('statDist',220)}${canvasEl('statHist',220)}</div>`;
-      const d1=$('[data-chart="statDist"]'),h1=$('[data-chart="statHist"]');
-      if(d1)An.bars(d1,{items:sums.slice(0,8).map(x=>({label:new Date(x.s.createdAt).toLocaleDateString(),value:x.sum.dist,text:An.fmtNum(x.sum.dist),color:An.C.blue}))});
-      if(h1){const all=src.flatMap(s=>s.events||[]);const sig=An.speedSignal(all);const bins=An.binSignal(sig,0,Math.max(1,Math.max(...sig.map(x=>x.speed),1)),30,'max');
-        An.bars(h1,{items:bins.map((b,i)=>({label:`${Math.round(bins[i].v)}`,value:b.v,text:Math.round(b.v)+'',color:An.C.purple}))});}
+      setHTML(box,`<div class="grid2">${canvasEl('statDist',220)}${canvasEl('statSpeed',220)}</div>`);
+      const d1=$('[data-chart="statDist"]'),h1=$('[data-chart="statSpeed"]');
+      if(d1)An.schedule('statDist',()=>An.bars(d1,{items:src.slice(0,8).map(s=>({label:new Date(s.createdAt).toLocaleDateString(),value:s.digest.dist,text:An.fmtNum(s.digest.dist),color:An.C.blue}))}));
+      if(h1)An.schedule('statSpeed',()=>An.bars(h1,{items:src.slice(0,8).map(s=>({label:new Date(s.createdAt).toLocaleDateString(),value:s.digest.avg,text:Math.round(s.digest.avg)+' c/s',color:An.C.purple}))}));
     }else if(this.statTab==='sinput'){
-      box.innerHTML=`<section class="kpi4">
+      setHTML(box,`<section class="kpi4">
         ${kpi('Key Presses','',agg.keys.toLocaleString(),'keyboard','keys',An.C.violet)}
         ${kpi('Mouse Buttons','',agg.btn.toLocaleString(),'clicks','mouse',An.C.blue)}
         ${kpi('Distance','',An.fmtNum(agg.dist),'counts','move',An.C.purple)}
         ${kpi('Input Rate','',agg.dur?(agg.events/agg.dur).toFixed(1)+'/s':'—','events per second','rate',An.C.teal)}</section>
-        <canvas class="chart" data-chart="statKeys" style="width:100%;height:220px"></canvas>`;
-      const all=src.flatMap(s=>s.events||[]);const counts={};for(const e of An.keyPresses(all))counts[e.data.key]=(counts[e.data.key]||0)+1;
-      const cv=$('[data-chart="statKeys"]');if(cv)An.bars(cv,{items:Object.entries(counts).sort((a,b)=>b[1]-a[1]).slice(0,8).map(([label,value])=>({label,value,color:An.C.violet}))});
+        <canvas class="chart" data-chart="statKeys" style="width:100%;height:220px"></canvas>`);
+      const counts=new Map();
+      for(const s of src)for(const k of s.digest.topKeys||[])counts.set(k.label,(counts.get(k.label)||0)+k.value);
+      const items=[...counts.entries()].sort((a,b)=>b[1]-a[1]).slice(0,8).map(([label,value])=>({label,value,color:An.C.violet}));
+      const cv=$('[data-chart="statKeys"]');
+      if(cv)An.schedule('statKeys',()=>An.bars(cv,{items}));
     }else{
       // Weapon analysis — honest proxy panel: the log gives no weapon data.
-      box.innerHTML=`<div class="grid2">
+      setHTML(box,`<div class="grid2">
         <div class="panel inset"><div class="panel-head"><h2>Headshot vs Body</h2></div><canvas class="chart" data-chart="statHs" style="width:100%;height:180px"></canvas></div>
         <div class="panel inset"><div class="panel-head"><h2>Kill Outcomes</h2></div><canvas class="chart" data-chart="statWeap" style="width:100%;height:180px"></canvas></div></div>
-        <p class="muted">Weapon-level attribution (Vandal/Phantom/…) requires match details from Riot's authenticated endpoints; the local ShooterGame.log exposes only voice-line kill signals, so this panel tracks headshot vs bodyshot kills until that integration exists.</p>`;
-      const h=$('[data-chart="statHs"]');if(h)An.donut(h,{value:agg.kills?agg.hs/agg.kills:0,center:hsm.toFixed(1)+'%',label:'Headshot share',color:An.C.blue});
-      const w=$('[data-chart="statWeap"]');if(w)An.bars(w,{items:[{label:'Kills',value:agg.kills,color:An.C.green},{label:'Deaths',value:agg.deaths,color:An.C.red},{label:'Headshot kills',value:agg.hs,color:An.C.blue},{label:'Body kills',value:Math.max(0,agg.kills-agg.hs),color:An.C.purple}]});
+        <p class="muted">Weapon-level attribution (Vandal/Phantom/…) requires match details from Riot's authenticated endpoints; the local ShooterGame.log exposes only voice-line kill signals, so this panel tracks headshot vs bodyshot kills until that integration exists.</p>`);
+      const h=$('[data-chart="statHs"]');
+      if(h)An.schedule('statHs',()=>An.donut(h,{value:agg.kills?agg.hs/agg.kills:0,center:hsm.toFixed(1)+'%',label:'Headshot share',color:An.C.blue}));
+      const w=$('[data-chart="statWeap"]');
+      if(w)An.schedule('statWeap',()=>An.bars(w,{items:[
+        {label:'Kills',value:agg.kills,color:An.C.green},
+        {label:'Deaths',value:agg.deaths,color:An.C.red},
+        {label:'Headshot kills',value:agg.hs,color:An.C.blue},
+        {label:'Body kills',value:Math.max(0,agg.kills-agg.hs),color:An.C.purple}]}));
     }
   }
 };
-function avgEff(events,sum){const fl=An.detectFlicks(events);if(!fl.length)return 0;return fl.reduce((a,f)=>a+f.efficiency,0)/fl.length}
+
 function kpi(label,id,value,sub,icon,color){return `<div class="card"><span class="kpi-ico" style="color:${color};border-color:${color}33">${({target:'◎',aim:'⊙',react:'⚡',mouse:'🖱',keys:'⌨',list:'☰',clock:'◷',move:'⇄',rate:'≈',bolt:'✦'}[icon]||'●')}</span><span class="kpi-label">${label}</span><strong data-kpi="${id}">${value??''}</strong><small data-kpisub="${id}">${sub??''}</small></div>`}
-function setKpi(id,value,sub){const v=$(`[data-kpi="${id}"]`);if(v&&value!=='')v.textContent=value;const s2=$(`[data-kpisub="${id}"]`);if(s2&&sub!==undefined)s2.textContent=sub}
+function setKpi(id,value,sub){setText($(`[data-kpi="${id}"]`),String(value));setText($(`[data-kpisub="${id}"]`),String(sub??''))}
 function badge(text,cls){return `<span class="badge ${cls||'gray'}">${text}</span>`}
 function roundRow(r){
   const color=r.kills&&!r.deaths?'#22C55E':r.deaths&&!r.kills?'#EF4444':r.kills&&r.deaths?'#3B82F6':'#64748B';

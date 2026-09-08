@@ -1,0 +1,99 @@
+<!doctype html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<title>Mouse-Stats — Valorant Integration &amp; UI Redesign Report</title>
+<style>
+body{font-family:"Segoe UI",system-ui,sans-serif;background:#0B0F1A;color:#F1F5F9;margin:0;padding:32px;line-height:1.55}
+.wrap{max-width:960px;margin:0 auto}
+h1{font-size:24px;margin-bottom:4px}
+h2{font-size:17px;margin:28px 0 10px;color:#3B82F6;border-bottom:1px solid #1E2A3F;padding-bottom:6px}
+h3{font-size:14px;margin:16px 0 6px}
+p,li{color:#c7d2e4;font-size:13.5px}
+code,pre{font-family:Consolas,monospace;font-size:12px;background:#0d1526;border:1px solid #1E2A3F;border-radius:6px}
+code{padding:1px 5px}
+pre{padding:12px;overflow-x:auto}
+table{width:100%;border-collapse:collapse;margin:10px 0;font-size:12.5px}
+th{color:#64748B;text-align:left;border-bottom:1px solid #1E2A3F;padding:7px 8px}
+td{border-bottom:1px solid #14203a;padding:7px 8px;vertical-align:top}
+.pass{color:#22C55E;font-weight:600}.warn{color:#F97316;font-weight:600}.mut{color:#64748B}
+.meta{color:#64748B;font-size:12px;margin-bottom:20px}
+.card{background:#111A2B;border:1px solid #1E2A3F;border-radius:10px;padding:16px 18px;margin:14px 0}
+</style>
+</head>
+<body><div class="wrap">
+<h1>Mouse-Stats — Valorant Integration &amp; UI Redesign</h1>
+<div class="meta">Project: <code>C:\Users\eadan\Downloads\mouse-stats-v2</code> · Date: 2026-09-07 · Session: AutoCoder</div>
+
+<h2>Outcome</h2>
+<p>Implemented in full: the Valorant log-driven capture integration (no API key, no Riot login, read-only), the Dashboard / Sessions / Settings redesigns matching the two AimingData reference screenshots (with the two changes you specified — Open&nbsp;Replay replaced by the Capturing/Idle indicator, and the Replays/Statistics tabs folded into Sessions and Dashboard), the DPI-vs-eDPI translation math, dual-axis speed comparison, flick/micro-adjustment/flick-back analysis, live 1:1 graphs, and colored round/kill/death session markers. All syntax checks pass; the log parser passes a 17/17 fixture suite; a full simulated match verified auto-start, map detection, event markers, and auto-stop end-to-end against the real running app.</p>
+
+<h2>Valorant data source (the “valorant-match” approach, credential-free)</h2>
+<p>Implemented the same mechanism used by Overwolf’s VALORANT parser and the gigi project: tail <code>%LocalAppData%\VALORANT\Saved\Logs\ShooterGame.log</code> byte-offset-style (rotation-safe) and run the production regex set over new lines. Strictly read-only. Verified map/agent codename tables against <code>valorant-api.com</code> (this also corrected an error in gigi’s docs: Foxtrot=Breeze, Canyon=Fracture).</p>
+<table>
+<tr><th>Log signal</th><th>Produces</th></tr>
+<tr><td><code>Map Name: characterselectpersistentlevel</code></td><td>Agent select → <b>auto-start capture</b></td></tr>
+<tr><td><code>Map Name: &lt;codename&gt;</code></td><td>Map (auto-set on session; Port→Icebox etc.)</td></tr>
+<tr><td><code>Reconcile called with the current state: InGame</code></td><td>Game began marker</td></tr>
+<tr><td><code>InGame … Scheduling a reconcile</code></td><td>Post-match → <b>auto-stop &amp; save</b></td></tr>
+<tr><td><code>Reconcile … MainMenu</code></td><td>Game ended (fallback stop; lobby blips cancel instead of saving)</td></tr>
+<tr><td><code>Gameplay started at local time 0.0…</code></td><td>Round began (blue marker)</td></tr>
+<tr><td><code>Play_VO_&lt;agent&gt;…Kill / HeadshotKill</code></td><td>Kill (green marker)</td></tr>
+<tr><td><code>Play_VO_&lt;agent&gt;_DeathEffort</code></td><td>Death (red marker)</td></tr>
+<tr><td><code>MatchId / Current character / GameModes</code></td><td>Match ID, agent, mode stored on the session</td></tr>
+</table>
+<p class="mut">Known limitation (inherent to the log): kill/death detection is voice-line based, so it is approximate — an agent bark may not fire for every kill and can lag slightly. Round/map/match lifecycle events are deterministic.</p>
+
+<h2>Verification evidence</h2>
+<table>
+<tr><th>Check</th><th>Result</th><th>Detail</th></tr>
+<tr><td>Parser fixture suite</td><td class="pass">17/17 PASS</td><td>Real <code>ValorantWatcher</code> fed synthetic log: agent_select ×1, map Port→Icebox, match_start ×1 (postmatch line must not re-fire it), round markers [1,3] (+2 convention), 2 kills + 1 headshot, 1 death, single match_end, other-agent bark ignored</td></tr>
+<tr><td>Simulated match e2e (real app, real processes)</td><td class="pass">PASS</td><td>Session auto-created on agent select → map auto-patched to Icebox → auto-stopped on postmatch → saved with <code>stats {matches:1, rounds:2, kills:3, deaths:1, headshots:1}</code> and ordered game-event stream; 4,688 live input events captured alongside</td></tr>
+<tr><td>Syntax checks</td><td class="pass">PASS</td><td><code>node --check</code> on all 7 JS files; <code>py_compile</code> on all collector files</td></tr>
+<tr><td>Web assets served</td><td class="pass">PASS</td><td>All 8 paths 200 with correct MIME (<code>text/javascript</code>/<code>text/css</code>)</td></tr>
+<tr><td>Browser click-through</td><td class="warn">Not verified</td><td>JS is syntax-checked and logic-reviewed, but the UI was not exercised in a live browser this session</td></tr>
+<tr><td>Real ShooterGame.log</td><td class="warn">Not verified live</td><td>Parser verified against the documented production regexes, not yet against your machine’s live log</td></tr>
+</table>
+
+<h2>What changed, by area</h2>
+<h3>Collector (Python)</h3>
+<ul>
+<li><code>collector/valorant.py</code> (new) — log tailer + parser + state machine (menu / agent_select / live / postmatch); exposes snapshot via <code>/health</code> and records <code>game_*</code> events into the collector buffer with the same <code>perf_counter</code> clock as input events, so markers land inside the session timeline automatically.</li>
+<li><code>collector/main.py</code> — starts the watcher thread (win32), wires <code>game_info</code> into the handler.</li>
+<li><code>collector/server.py</code> — <code>/health</code> now includes the game snapshot.</li>
+</ul>
+<h3>Core (Node)</h3>
+<ul>
+<li><code>core/server.mjs</code> — game-phase poller (1.5&nbsp;s) driving automatic session start/stop/cancel; active-session map/agent/matchId patching; <code>GET/POST /api/settings</code> persisted to <code>data/settings.json</code>; <code>POST /api/sessions/:id/notes</code>; <code>DELETE /api/sessions/:id</code>; collector restart/stop/start; per-session <code>stats</code> computed at save; <code>?meta=1</code> list mode that strips event payloads.</li>
+</ul>
+<h3>Web (complete redesign)</h3>
+<ul>
+<li><b>Dashboard</b> — reference image 1: KPI row (K/D, Headshot&nbsp;%, Flick Latency, Avg Mouse Speed ±σ, Keys Pressed), live input stage (1:1 realtime cursor replay), Round Details / Key Events tabs, Rounds list, Round Analysis (gauge + per-round stats + notes), analytics tabs (Mouse Movement X/Y, Aim Analysis, Keyboard, Heatmap, Frequency Analysis), and the Statistics block (Overview, Aim, Movement, Input, Weapon Analysis) with scope selector. Capture indicator (LIVE pulsing / Idle) replaces “Open Replay”.</li>
+<li><b>Sessions</b> — reference image 2 top-left: sessions table (Date, Duration, Matches, Rounds, K/D, Status, Actions with ⋯ menu), Session Details card (map thumbnail, Match ID, mode, map, rounds, duration) and Rounds panel. <b>View All</b> expands the session full-page: back arrow, full-width replay player (~2.2:1) with colored-marker timeline + timestamp labels, play/pause, seek, 0.25×–16× multiplier, fullscreen; lower half holds the nine analysis panels (Mouse Movement X/Y, Mouse Speed vs Time, Aim Analysis, Keyboard, Heatmap, Aim Heatmap, Frequency Analysis, Input Overlay, Round Analysis).</li>
+<li><b>Settings</b> — reference image 2 bottom-right <i>minus</i> the Valorant Integration panel: Collector (buffer size, auto start/stop, skip-the-range, restart/stop/start), Display, Data &amp; Storage, Advanced, plus an <b>Input Translation</b> panel (DPI, sensitivity, polling rate; computed eDPI and cm/360) that feeds all chart translations.</li>
+<li><b>Analysis engine</b> — <code>analysis.js</code>: exact translation math (deg/s = counts/s × 0.022 × sens — DPI affects physical cm only, eDPI affects in-game rotation), rolling-baseline flick detection with micro-adjustment (mid-flick reversals), correction time and flick-back detection, cursor heatmaps (plain and speed/click-weighted), DFT frequency spectrum, round reconstruction, and a dual-axis chart engine (raw counts/s left, translated °/s right).</li>
+</ul>
+
+<h2>Changed files</h2>
+<pre>collector/valorant.py     new   (log watcher, 12.7 KB)
+collector/main.py         mod   (watcher thread)
+collector/server.py       mod   (game state in /health)
+core/server.mjs           mod   (auto-capture poller, settings, endpoints)
+web/index.html            mod   (script wiring)
+web/app.js                mod   (shell/router, 3 tabs)
+web/styles.css            mod   (full theme per reference palette)
+web/analysis.js           new   (math + chart engine)
+web/stage.js              new   (input replay stage)
+web/dashboard.js          new   (dashboard)
+web/sessions.js           new   (sessions + player + analysis)
+web/settings.js           new   (settings)</pre>
+<p>Pre-change copies are preserved as <code>*.bak2</code> next to each replaced file (plus the earlier hook-fix backups <code>mouse.py.bak</code>/<code>keyboard.py.bak</code>).</p>
+
+<h2>Actions needed from you / leftovers</h2>
+<ul>
+<li><b>One leftover test instance is still running</b> from the e2e verification (node PID 10372, collector python PID 8152). Its watcher points at a throwaway test log, so Valorant auto-capture would be inert in that instance. The Safety Guard did not approve my cleanup command this turn, so stop it manually before relaunching, e.g. <code>taskkill /PID 10372 /PID 8152 /F</code> — then start the app normally with <code>py run.py</code>.</li>
+<li>The simulated-match session and its temp log were removed / are inert; your 10 real sessions are untouched. They predate the stats field, so Matches/Rounds/K-D columns show “—” for them; new sessions get stats automatically.</li>
+<li>Weapon-level attribution (Vandal/Phantom/…) is not derivable from the local log — the Weapon Analysis panel states this and tracks headshot/body split until an authenticated match-details integration is added.</li>
+<li>First real match will be the live validation of the parser on your actual log; if a marker misfires, send me the startup console output — the watcher logs every transition as <code>[capture]</code>.</li>
+</ul>
+</div></body></html>

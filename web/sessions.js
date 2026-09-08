@@ -1,6 +1,11 @@
 // sessions.js — sessions browser + expanded session detail with replay player.
+//
+// The list and the side panel run entirely off session metadata (each session's
+// `digest`, computed once by the core). Raw events are downloaded only when a
+// session is actually opened for replay, and then analysed in a single pass
+// instead of a dozen full-history scans, one per panel.
 const Sess={
-  view:'list',filter:'all',sel:null,stage:null,tl:null,raf:0,lastFrame:0,
+  view:'list',filter:'all',sel:null,stage:null,tl:null,raf:0,lastFrame:0,an:null,
 
   render(){
     return this.view==='list'?this.renderList():this.renderDetail();
@@ -62,7 +67,11 @@ const Sess={
   mountList(){
     $('#sessFilter').value=this.filter;
     $('#sessFilter').onchange=e=>{this.filter=e.target.value;this.drawRows()};
-    $('#exportAll').onclick=()=>downloadJSON(S.sessions,'mouse-stats-sessions.json');
+    $('#exportAll').onclick=async()=>{
+      // metadata only — exporting every session's raw events would be hundreds of MB
+      const btn=$('#exportAll');btn.disabled=true;
+      try{downloadJSON(S.sessions,'mouse-stats-sessions.json')}finally{btn.disabled=false}
+    };
     this.drawRows();
     const sel=this.sel?S.sessions.find(x=>x.sessionId===this.sel):S.sessions[0];
     if(sel)this.drawDetails(sel);
@@ -71,126 +80,161 @@ const Sess={
 
   drawRows(){
     const rows=S.sessions.filter(s=>this.filter==='all'||(this.filter==='1'?new Date(s.createdAt).toDateString()===new Date().toDateString():Date.now()-new Date(s.createdAt).getTime()<7*864e5));
-    $('#sessRows').innerHTML=rows.map(s=>`<tr data-sess="${s.sessionId}" class="${this.sel===s.sessionId?'sel':''}">
+    setHTML($('#sessRows'),rows.map(s=>`<tr data-sess="${s.sessionId}" class="${this.sel===s.sessionId?'sel':''}">
       <td><b>${new Date(s.createdAt).toLocaleString()}</b><small>${relDay(s.createdAt)}</small></td>
       <td>${fmtDur(s.durationSeconds)}</td>
-      <td>${s.stats?.matches??'—'}</td><td>${s.stats?.rounds??'—'}</td>
+      <td>${s.stats?.matches??'—'}</td><td>${s.stats?.rounds??s.digest?.rounds??'—'}</td>
       <td>${s.stats?(s.stats.kills??0)+' / '+(s.stats.deaths??0):'—'}</td>
       <td>${badge('Completed','green')}</td>
       <td><div class="actions"><button class="primary small" data-view="${s.sessionId}">View All</button>
         <button class="ghost small" data-menu="${s.sessionId}">⋯</button>
         <div class="menu hidden" data-menufor="${s.sessionId}"><button data-view="${s.sessionId}">View All</button><button data-export="${s.sessionId}">Export JSON</button><button data-del="${s.sessionId}" class="danger">Delete</button></div></div></td>
-      </tr>`).join('')||'<tr><td colspan="7" class="empty">No saved sessions yet — start a capture or queue a VALORANT match.</td></tr>';
+      </tr>`).join('')||'<tr><td colspan="7" class="empty">No saved sessions yet — start a capture or queue a VALORANT match.</td></tr>');
     $$('#sessRows tr[data-sess]').forEach(tr=>tr.onclick=e=>{if(e.target.closest('button'))return;this.sel=tr.dataset.sess;this.drawRows();const s=S.sessions.find(x=>x.sessionId===this.sel);if(s)this.drawDetails(s)});
     $$('#sessRows [data-view]').forEach(b=>b.onclick=()=>this.openDetail(b.dataset.view));
-    $$('#sessRows [data-export]').forEach(b=>b.onclick=async()=>{const s=await api('/sessions/'+b.dataset.export);downloadJSON(s.session,'session-'+b.dataset.export.slice(0,8)+'.json')});
-    $$('#sessRows [data-del]').forEach(b=>b.onclick=async()=>{if(!confirm('Delete this session permanently?'))return;await api('/sessions/'+b.dataset.del,{method:'DELETE'});if(this.sel===b.dataset.del)this.sel=null;await loadSessions();this.drawRows()});
+    $$('#sessRows [data-export]').forEach(b=>b.onclick=async()=>{b.disabled=true;try{const s=await api('/sessions/'+b.dataset.export);downloadJSON(s.session,'session-'+b.dataset.export.slice(0,8)+'.json')}finally{b.disabled=false}});
+    $$('#sessRows [data-del]').forEach(b=>b.onclick=async()=>{if(!confirm('Delete this session permanently?'))return;await api('/sessions/'+b.dataset.del,{method:'DELETE'});if(this.sel===b.dataset.del)this.sel=null;if(S.latest?.sessionId===b.dataset.del)S.latest=null;await loadSessions();this.drawRows()});
     $$('#sessRows [data-menu]').forEach(b=>b.onclick=e=>{e.stopPropagation();const m=$(`[data-menufor="${b.dataset.menu}"]`);$$('.menu').forEach(x=>x!==m&&x.classList.add('hidden'));m.classList.toggle('hidden')});
   },
 
-  async drawDetails(s){
+  // Side panel: metadata only, no raw-event fetch.
+  drawDetails(s){
     this.sel=s.sessionId;
-    $('#sdTitle').textContent=`Session Details - ${fmtDate(s.createdAt)}`;
-    $('#sdBadge').innerHTML=badge('Completed','green');
-    let full=s;
-    if(s.events===undefined||s.events===null){full=(await api('/sessions/'+s.sessionId)).session}
-    const st=full.stats||{};
-    const rounds=full.events?An.rounds(full.events,full.endTimestamp):[];
-    $('#sdBox').innerHTML=`<div class="sd-grid">
+    const d=s.digest||{};
+    setText($('#sdTitle'),`Session Details - ${fmtDate(s.createdAt)}`);
+    setHTML($('#sdBadge'),badge('Completed','green'));
+    const st=s.stats||{};
+    setHTML($('#sdBox'),`<div class="sd-grid">
       <div class="mapthumb ${esc((s.map||'unknown').toLowerCase().replace(/[^a-z0-9]/g,''))}">${esc((s.map||'?').slice(0,2).toUpperCase())}</div>
-      <div class="kv"><span>Match ID</span><b>${esc(full.matchId||'local session')}</b></div>
+      <div class="kv"><span>Match ID</span><b>${esc(s.matchId||'local session')}</b></div>
       <div class="kv"><span>Game Mode</span><b>${esc(s.mode||'—')}</b></div>
       <div class="kv"><span>Map</span><b>${esc(s.map||'—')}</b></div>
-      <div class="kv"><span>Total Rounds</span><b>${st.rounds??rounds.length??'—'}</b></div>
+      <div class="kv"><span>Total Rounds</span><b>${st.rounds??d.rounds??'—'}</b></div>
       <div class="kv"><span>Duration</span><b>${fmtDur(s.durationSeconds)}</b></div>
-      <div class="kv"><span>Events</span><b>${s.eventCount??(full.events||[]).length}</b></div></div>
-      <button class="primary" id="sdOpen">View All</button>`;
-    $('#sdRounds').innerHTML=rounds.length?rounds.map(r=>roundRow(r)).join(''):'<p class="empty">No round markers in this session.</p>';
+      <div class="kv"><span>Events</span><b>${(s.eventCount??d.events??0).toLocaleString()}</b></div></div>
+      <button class="primary" id="sdOpen">View All</button>`);
+    const rounds=d.roundList||[];
+    setHTML($('#sdRounds'),rounds.length?rounds.map(roundRow).join(''):'<p class="empty">No round markers in this session.</p>');
     $('#sdOpen').onclick=()=>this.openDetail(s.sessionId);
   },
 
   async openDetail(id){
-    const s=(await api('/sessions/'+id)).session;
-    S.selected=s;S.selEvents=s.events||[];
-    S.play={playing:false,pos:0,speed:S.play.speed,raf:0};
-    this.view='detail';render();
+    const row=$(`#sessRows [data-view="${id}"]`);
+    if(row){row.disabled=true;row.textContent='Loading…'}
+    try{
+      const s=(await api('/sessions/'+id)).session;
+      S.selected=s;S.selEvents=s.events||[];
+      // One pass over the session feeds every panel below.
+      this.an=new An.Analyzer({ringCap:Math.max(1024,S.selEvents.length)}).feed(S.selEvents).finalize();
+      S.play={playing:false,pos:0,speed:S.play.speed,raf:0};
+      this.view='detail';render();
+    }catch(e){
+      console.error('[session]',e);
+      if(row){row.disabled=false;row.textContent='View All'}
+      alert('Could not load that session: '+e.message);
+    }
   },
 
   mountDetail(){
-    const s=S.selected;const ev=S.selEvents;
+    const s=S.selected,ev=S.selEvents,a=this.an;
     const t0=s.startTimestamp,t1=s.endTimestamp||t0+1;
     this.stage=new InputStage($('#playerStage'));
     this.stage.reset(ev,t0);this.stage.advanceTo(0);this.stage.draw();
-    // timeline
+
+    // ---- timeline scrubber --------------------------------------------------
+    // The marker set never changes, so cache it instead of rebuilding it on
+    // every animation frame of playback.
+    const marks=a.timeline;
     const tl=$('#timeline');
     const drawTl=()=>{
       const {x,w,h}=An.prep(tl);
       x.fillStyle='#0d1424';x.fillRect(0,0,w,h);
-      const marks=An.gameTimeline(ev);
       for(const m of marks){const px=(m.t-t0)/(t1-t0)*w;x.fillStyle=m.color;x.fillRect(px-0.75,4,1.5,h-8)}
-      const prog=(S.play.pos)/(t1-t0)*w;
+      const prog=S.play.pos/(t1-t0)*w;
       x.fillStyle='rgba(59,130,246,0.25)';x.fillRect(0,0,prog,h);
       x.fillStyle='#3B82F6';x.fillRect(prog-1,0,2,h);
-      // colored timestamp labels under a few markers
       x.font='9px Segoe UI';x.textAlign='center';
       const step=Math.max(1,Math.floor(marks.length/10));
-      marks.forEach((m,i)=>{if(i%step)return;const px=(m.t-t0)/(t1-t0)*w;x.fillStyle=m.color;x.fillText(An.fmtT(m.t-t0),Math.min(w-14,Math.max(14,px)),h-8)});
-    };
-    this.tl=drawTl;drawTl();
-    $('#seek').oninput=e=>{S.play.pos=Number(e.target.value)/1000*(t1-t0);this.stage.seek(t0+S.play.pos);this.stage.draw();drawTl();updTime()};
-    $('#playBtn').onclick=()=>{S.play.playing=!S.play.playing;$('#playBtn').textContent=S.play.playing?'❚❚':'▶';if(S.play.playing)this.loop();};
-    $('#speedSel').onchange=e=>S.play.speed=Number(e.target.value);
-    $('#fsBtn').onclick=()=>{const p=$('.player-panel');if(document.fullscreenElement)document.exitFullscreen();else p.requestFullscreen&&p.requestFullscreen()};
-    $('#backBtn').onclick=()=>{cancelAnimationFrame(this.raf);S.play.playing=false;this.view='list';S.selected=null;render()};
-    $('#exportOne').onclick=()=>downloadJSON(s,'session-'+s.sessionId.slice(0,8)+'.json');
-    const updTime=()=>{$('#timeLabel').textContent=`${An.fmtT(S.play.pos)} / ${An.fmtT(t1-t0)}`;$('#seek').value=Math.min(1000,S.play.pos/(t1-t0)*1000)};
-    this.updTime=updTime;updTime();
-    this.loopFn=()=>{
-      if(S.play.playing){
-        const now=performance.now();
-        const dt=Math.min(0.1,(now-(this.lastFrame||now))/1000);
-        this.lastFrame=now;
-        S.play.pos=Math.min(t1-t0,S.play.pos+dt*S.play.speed);
-        this.stage.seek(t0+S.play.pos);this.stage.draw();drawTl();updTime();
-        if(S.play.pos>=t1-t0){S.play.playing=false;$('#playBtn').textContent='▶'}
-        else this.raf=requestAnimationFrame(this.loopFn);
+      for(let i=0;i<marks.length;i+=step){
+        const m=marks[i],px=(m.t-t0)/(t1-t0)*w;
+        x.fillStyle=m.color;x.fillText(An.fmtT(m.t-t0),Math.min(w-14,Math.max(14,px)),h-8);
       }
     };
+    this.tl=drawTl;drawTl();
+
+    const updTime=()=>{setText($('#timeLabel'),`${An.fmtT(S.play.pos)} / ${An.fmtT(t1-t0)}`);$('#seek').value=Math.min(1000,S.play.pos/(t1-t0)*1000)};
+    this.updTime=updTime;updTime();
+
+    $('#seek').oninput=e=>{S.play.pos=Number(e.target.value)/1000*(t1-t0);this.stage.seek(t0+S.play.pos);this.stage.draw();drawTl();updTime()};
+    $('#playBtn').onclick=()=>{S.play.playing=!S.play.playing;$('#playBtn').textContent=S.play.playing?'❚❚':'▶';if(S.play.playing)this.loop()};
+    $('#speedSel').onchange=e=>S.play.speed=Number(e.target.value);
+    $('#fsBtn').onclick=()=>{const p=$('.player-panel');if(document.fullscreenElement)document.exitFullscreen();else p.requestFullscreen&&p.requestFullscreen()};
+    $('#backBtn').onclick=()=>{cancelAnimationFrame(this.raf);S.play.playing=false;this.view='list';S.selected=null;S.selEvents=[];this.an=null;render()};
+    $('#exportOne').onclick=()=>downloadJSON(s,'session-'+s.sessionId.slice(0,8)+'.json');
+
+    this.loopFn=()=>{
+      if(!S.play.playing)return;
+      const now=performance.now();
+      const dt=Math.min(0.1,(now-(this.lastFrame||now))/1000);
+      this.lastFrame=now;
+      S.play.pos=Math.min(t1-t0,S.play.pos+dt*S.play.speed);
+      this.stage.seek(t0+S.play.pos);this.stage.draw();drawTl();updTime();
+      if(S.play.pos>=t1-t0){S.play.playing=false;$('#playBtn').textContent='▶'}
+      else this.raf=requestAnimationFrame(this.loopFn);
+    };
     this.loop=()=>{this.lastFrame=performance.now();cancelAnimationFrame(this.raf);this.raf=requestAnimationFrame(this.loopFn)};
-    // analysis panels
+
+    // ---- analysis panels, all off the single analyzer pass ------------------
     const sens=S.settings?.sensitivity??0.5,dpi=S.settings?.dpi??800;
+    const deg=An.degPerCount(sens);
     const X=t=>An.fmtT(t-t0);
-    const ge=An.gameTimeline(ev);const markers=ge.map(e=>({t:e.t,color:e.color}));
-    const mv=An.moves(ev);const step=Math.max(1,Math.floor(mv.length/600));
-    const xs=[],ys=[];for(let i=0;i<mv.length;i+=step){xs.push({x:mv[i].timestamp,y:mv[i].data.dx||0});ys.push({x:mv[i].timestamp,y:mv[i].data.dy||0})}
-    const xy=$('[data-chart="xy"]');if(xy)An.lineChart(xy,{t0,t1,xFmt:X,series:[{name:'X',color:An.C.blue,points:xs},{name:'Y',color:An.C.purple,points:ys}]});
-    const sig=An.speedSignal(ev);const nb=240;
-    const binsC=An.binSignal(sig,t0,t1,nb,'max');const binsD=binsC.map(b=>({x:b.x,y:b.v*An.degPerCount(sens)}));
-    const dual=$('[data-chart="dual"]');if(dual)An.lineChart(dual,{t0,t1,xFmt:X,rightAxis:true,yLeft:{max:An.niceMax(Math.max(1,...binsC.map(b=>b.v)))},yRight:{max:An.niceMax(Math.max(1,...binsD.map(b=>b.v)))},
-      series:[{name:'Raw (counts/s)',color:An.C.blue,points:binsC.map(b=>({x:b.x,y:b.v}))},{name:'Translated (°/s)',color:An.C.purple,points:binsD,axis:'right'}]});
-    const fl=An.detectFlicks(ev);
-    const ft=$('#aimFlicks');
-    if(ft)ft.innerHTML=fl.length?`<table class="mini"><thead><tr><th>Time</th><th>Peak c/s</th><th>Peak °/s</th><th>Angle</th><th>Dur</th><th>Micro</th><th>Correct</th><th>Flick-back</th></tr></thead><tbody>${fl.slice(-12).reverse().map(f=>`<tr><td>${An.fmtT(f.t0-t0)}</td><td>${Math.round(f.peak)}</td><td>${Math.round(f.peak*An.degPerCount(sens))}</td><td>${f.angleDeg}°</td><td>${f.durMs}ms</td><td>${f.micro}</td><td>${f.correctionMs}ms</td><td>${f.flickBack?`✓ ${f.flickBack.delayMs}ms`:f.flickBack===null?'—':'—'}</td></tr>`).join('')}</tbody></table><p class="muted">Yaw 0.022°/count: °/s = c/s × 0.022 × sens (${sens}); DPI (${dpi}) affects physical cm only, eDPI (${An.edpi(dpi,sens)}) affects in-game rotation. Micro = mid-flick direction reversals (micro-adjustments); Correct = correction time after peak.</p>`:'<p class="empty">No flick bursts detected.</p>';
-    const counts={};for(const e of An.keyPresses(ev))counts[e.data.key]=(counts[e.data.key]||0)+1;
-    const keys=$('[data-chart="keys"]');if(keys)An.bars(keys,{items:Object.entries(counts).sort((a,b)=>b[1]-a[1]).slice(0,8).map(([label,value])=>({label,value,color:An.C.purple}))});
-    const heat=$('[data-chart="heat"]');if(heat)An.heatmap(heat,{grid:An.heatmapGrid(ev,96,48,false)});
-    const aimh=$('[data-chart="aimheat"]');if(aimh)An.heatmap(aimh,{grid:An.heatmapGrid(ev,96,48,true)});
-    const binsF=An.binSignal(sig,t0,t1,256,'mean');const mags=An.spectrum(binsF,48);
-    const spec=$('[data-chart="spec"]');if(spec)An.spectrumChart(spec,{mags});
-    const note=$('#specNote');if(note){const dom=mags.slice().sort((a,b)=>b.mag-a.mag)[0];note.textContent=dom&&dom.mag>1?`Dominant component ≈ ${(dom.freq*((t1-t0)/256)).toFixed(1)} Hz`:'Not enough motion.'}
-    const ov=$('[data-chart="overlay"]');if(ov)An.tickStrip(ov,{t0,t1,xFmt:X,lanes:[
-      {name:'Mouse Move',color:An.C.blue,ticks:mv.map(e=>e.timestamp)},
-      {name:'Left Click',color:An.C.green,ticks:ev.filter(e=>e.type==='mouse_button'&&e.data.state==='down'&&e.data.button==='left').map(e=>e.timestamp)},
-      {name:'Right Click',color:An.C.orange,ticks:ev.filter(e=>e.type==='mouse_button'&&e.data.state==='down'&&e.data.button==='right').map(e=>e.timestamp)},
-      {name:'Key Press',color:An.C.purple,ticks:An.keyPresses(ev).map(e=>e.timestamp)}]});
-    const rounds=An.rounds(ev,t1);
-    const rt=$('#roundTable');
-    if(rt)rt.innerHTML=rounds.length?`<table class="mini"><thead><tr><th>Round</th><th>Start</th><th>Duration</th><th>Kills</th><th>Deaths</th><th>HS</th><th>Distance</th></tr></thead><tbody>
-      ${rounds.map(r=>`<tr><td><b>${r.n}</b></td><td>${An.fmtT(r.t0-t0)}</td><td>${fmtDur((r.t1||t1)-r.t0)}</td><td>${r.kills}</td><td>${r.deaths}</td><td>${r.headshots}</td><td>${An.fmtNum(r.distance)}</td></tr>`).join('')}</tbody></table>`:'<p class="empty">No VALORANT round markers in this session.</p>';
+
+    const {xs,ys}=a.moveSeries(t0,600);
+    const xy=$('[data-chart="xy"]');
+    if(xy)An.schedule('d-xy',()=>An.lineChart(xy,{t0,t1,xFmt:X,series:[{name:'X',color:An.C.blue,points:xs},{name:'Y',color:An.C.purple,points:ys}]}));
+
+    const binsC=a.speedBins(t0,t1,240,'max');
+    let cmax=1;for(const b of binsC)if(b.v>cmax)cmax=b.v;
+    const dual=$('[data-chart="dual"]');
+    if(dual)An.schedule('d-dual',()=>An.lineChart(dual,{t0,t1,xFmt:X,rightAxis:true,
+      yLeft:{max:An.niceMax(cmax)},yRight:{max:An.niceMax(cmax*deg)},
+      series:[{name:'Raw (counts/s)',color:An.C.blue,points:binsC.map(b=>({x:b.t,y:b.v}))},
+              {name:'Translated (°/s)',color:An.C.purple,points:binsC.map(b=>({x:b.t,y:b.v*deg})),axis:'right'}]}));
+
+    const fl=a.flicks;
+    setHTML($('#aimFlicks'),fl.length?`<table class="mini"><thead><tr><th>Time</th><th>Peak c/s</th><th>Peak °/s</th><th>Angle</th><th>Dur</th><th>Micro</th><th>Correct</th><th>Flick-back</th></tr></thead><tbody>${fl.slice(-12).reverse().map(f=>`<tr><td>${An.fmtT(f.t0-t0)}</td><td>${Math.round(f.peak)}</td><td>${Math.round(f.peak*deg)}</td><td>${f.angleDeg}°</td><td>${f.durMs.toFixed(0)}ms</td><td>${f.micro}</td><td>${f.correctionMs}ms</td><td>${f.flickBack?`✓ ${f.flickBack.delayMs}ms`:'—'}</td></tr>`).join('')}</tbody></table><p class="muted">Yaw 0.022°/count: °/s = c/s × 0.022 × sens (${sens}); DPI (${dpi}) affects physical cm only, eDPI (${An.edpi(dpi,sens)}) affects in-game rotation. Micro = mid-flick direction reversals (micro-adjustments); Correct = correction time after peak. ${fl.length} flicks total.</p>`:'<p class="empty">No flick bursts detected.</p>');
+
+    const keys=$('[data-chart="keys"]');
+    if(keys){const items=a.topKeys(8).map(i=>({...i,color:An.C.purple}));An.schedule('d-keys',()=>An.bars(keys,{items}))}
+
+    const heat=$('[data-chart="heat"]');
+    if(heat)An.schedule('d-heat',()=>An.heatmap(heat,{grid:a.heatFlat,max:a.heatFlatMax}));
+    const aimh=$('[data-chart="aimheat"]');
+    if(aimh)An.schedule('d-aimheat',()=>An.heatmap(aimh,{grid:a.heat,max:a.heatMax}));
+
+    const mags=An.spectrum(a.speedBins(t0,t1,256,'mean'),48);
+    const spec=$('[data-chart="spec"]');
+    if(spec)An.schedule('d-spec',()=>An.spectrumChart(spec,{mags}));
+    let dom=null;for(const m of mags)if(!dom||m.mag>dom.mag)dom=m;
+    setText($('#specNote'),dom&&dom.mag>1?`Dominant component ≈ ${(dom.freq*((t1-t0)/256)).toFixed(1)} Hz`:'Not enough motion.');
+
+    const ov=$('[data-chart="overlay"]');
+    if(ov){
+      const lanes=[
+        {name:'Mouse Move',color:An.C.blue,ticks:a.moveTicks(t0)},
+        {name:'Left Click',color:An.C.green,ticks:a.clickLeft},
+        {name:'Right Click',color:An.C.orange,ticks:a.clickRight},
+        {name:'Key Press',color:An.C.purple,ticks:a.keyTicks(t0)}];
+      An.schedule('d-overlay',()=>An.tickStrip(ov,{t0,t1,xFmt:X,lanes}));
+    }
+
+    const rounds=a.roundsAt(t1);
+    setHTML($('#roundTable'),rounds.length?`<table class="mini"><thead><tr><th>Round</th><th>Start</th><th>Duration</th><th>Kills</th><th>Deaths</th><th>HS</th><th>Distance</th><th>Avg speed</th></tr></thead><tbody>
+      ${rounds.map(r=>{const rs=a.roundStats(r);return `<tr><td><b>${r.n}</b></td><td>${An.fmtT(r.t0-t0)}</td><td>${fmtDur((r.t1||t1)-r.t0)}</td><td>${r.kills}</td><td>${r.deaths}</td><td>${r.headshots}</td><td>${An.fmtNum(r.distance)}</td><td>${Math.round(rs.avg)} c/s</td></tr>`}).join('')}</tbody></table>`:'<p class="empty">No VALORANT round markers in this session.</p>');
   },
 
   tick(){/* static page; replay loop drives updates */}
 };
 
 function relDay(iso){const d=new Date(iso);const t=new Date();const dd=Math.floor((t-d)/864e5);if(dd===0)return 'Today';if(dd===1)return 'Yesterday';return `${dd} days ago`}
-function downloadJSON(obj,name){const b=new Blob([JSON.stringify(obj,null,2)],{type:'application/json'});const a=document.createElement('a');a.href=URL.createObjectURL(b);a.download=name;a.click();URL.revokeObjectURL(a.href)}
+function downloadJSON(obj,name){const b=new Blob([JSON.stringify(obj)],{type:'application/json'});const a=document.createElement('a');a.href=URL.createObjectURL(b);a.download=name;a.click();setTimeout(()=>URL.revokeObjectURL(a.href),1000)}
